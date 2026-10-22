@@ -1,0 +1,1366 @@
+--[[
+    LoxForgeUI  |  v1.0.0 Beta
+    Game      : A Bizarre Village
+    Framework : Airflow UI
+    Status    : Early Development
+]]
+
+local Airflow = loadstring(game:HttpGet("https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau"))()
+
+-- Theme -----------------------------------------------------------------
+-- Neutral near-black panels, thin grey borders and a white accent.
+-- Airflow reads Airflow.Theme when elements are built, so this must run
+-- before the window is created.
+local Theme = Airflow.Theme
+Theme.Background  = Color3.fromRGB(14, 14, 16)
+Theme.Surface     = Color3.fromRGB(18, 18, 21)
+Theme.Surface2    = Color3.fromRGB(22, 22, 25)
+Theme.Surface3    = Color3.fromRGB(44, 44, 50)
+Theme.Stroke      = Color3.fromRGB(34, 34, 39)
+Theme.StrokeHover = Color3.fromRGB(84, 84, 94)
+Theme.Accent      = Color3.fromRGB(240, 240, 244)
+Theme.AccentDark  = Color3.fromRGB(14, 14, 16)
+Theme.Text        = Color3.fromRGB(236, 236, 240)
+Theme.Muted       = Color3.fromRGB(128, 128, 138)
+Theme.Success     = Color3.fromRGB(96, 165, 250)
+
+-- Window + Home ---------------------------------------------------------
+-- `Home` is Airflow's built-in landing page. It is always created first,
+-- so it is Tab 1.
+local Window = Airflow:Window({
+    Name = "LoxForgeUI",
+    Title = "LoxForgeUI",
+    Subtitle = "v1.0.0 Beta",
+    Icon = "sparkles",
+    Size = UDim2.fromOffset(680, 500),
+    Keybind = "RightControl", -- shown in the sidebar as "RCtrl  to hide"
+    Loading = {
+        Title = "LoxForgeUI",
+        Text = "A Bizarre Village  ·  v1.0.0 Beta",
+        Duration = 1.6,
+    },
+    Home = {
+        Name = "Home",
+        Desc = "A Bizarre Village  ·  Early Development",
+        Icon = "house",
+        Welcome = "Welcome to LoxForgeUI, ",
+        Greeting = "Script hub for A Bizarre Village  ·  v1.0.0 Beta",
+        SectionName = "System info",
+        TabIcon = "layout-grid",
+        Stats = { "FPS", "Ping", "Executor", "Game", "Region", "Time", "Players", "Uptime" },
+        TimeFormat = "%H:%M",
+        Pages = {
+            {
+                Name = "Project",
+                Icon = "folder-open",
+                Entries = {
+                    {
+                        Title = "Project Information",
+                        Tag = "v1.0.0 Beta",
+                        Changes = {
+                            "Project: LoxForgeUI",
+                            "Version: v1.0.0 Beta",
+                            "Game: A Bizarre Village",
+                            "Framework: Airflow UI",
+                            "Status: Early Development",
+                        },
+                    },
+                },
+            },
+            {
+                Name = "About",
+                Icon = "info",
+                Entries = {
+                    {
+                        Title = "Welcome to LoxForgeUI",
+                        Content = "A custom Roblox script hub being developed for A Bizarre Village, designed with a clean interface, organized navigation, and room for future expansion.",
+                    },
+                    {
+                        Title = "About the Project",
+                        Content = "LoxForgeUI is currently in early development. This release establishes the project's visual identity, interface, and navigation structure. Additional features may be introduced in future updates.",
+                    },
+                },
+            },
+            {
+                Name = "Changelog",
+                Icon = "scroll-text",
+                Entries = {
+                    {
+                        Title = "v1.0.0 Beta",
+                        Tag = "Latest",
+                        Changes = {
+                            "Initial beta release",
+                            "Home dashboard with live session stats",
+                            "Sidebar tab search",
+                            "Farm: live item list, collect on select, auto collect",
+                        },
+                    },
+                },
+            },
+        },
+    },
+})
+
+-- Home: divider + development status -------------------------------------
+-- Elements added after the built-in layout appear below it.
+local Home = Window.Home
+
+Home:CreateDivider()
+Home:Paragraph({
+    Name = "Development Status",
+    Content = "This is a beta build. The interface and the available features may evolve, change, or be reorganized as development continues.",
+})
+
+-- Tab 2: Farm -------------------------------------------------------------
+local Farm = Window:Tab({
+    Name = "Farm",
+    Icon = "sprout",
+})
+
+-- Farm: items -------------------------------------------------------------
+-- Live list of everything inside workspace.SpawnedTools.
+--   * Picking an entry teleports to it and (optionally) collects it.
+--   * "Teleport To All Item" / "Auto Collect All Items" visit every item one
+--     by one and only move on once the current item has been picked up.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local ITEM_FOLDER_NAME = "SpawnedTools"
+local REBUILD_INTERVAL = 0.1 -- minimum seconds between dropdown rebuilds
+
+local config = {
+    safe = true,            -- skip items over water / void, reset fall speed
+    collectOnSelect = true, -- picking an item in the dropdown also collects it
+    height = 3,             -- studs above the item to stand
+    timeout = 10,           -- seconds before an item that cannot be picked up is skipped
+}
+
+-- UI handles (created below, used by the functions in between)
+local countLabel, lastTeleportLabel, statusLabel, collectedLabel, itemDropdown, autoToggle
+
+-- State
+local itemMap = {}          -- dropdown label -> item instance
+local lastLabel = nil       -- label currently selected in the dropdown
+local running = false       -- a collector is active
+local runToken = 0          -- bumped to cancel the active collector
+local loopMode = false      -- Auto Collect All Items: keep waiting for new items
+local sweep = false         -- "Teleport To All Item": one pass over every item
+local priority = {}         -- items picked in the dropdown, handled before anything else
+local totalCollected = 0
+local failReason = ""
+
+local function notify(title, content, kind)
+    Window:Notify({
+        Title = title,
+        Content = content,
+        Type = kind or "Info",
+        Duration = 3,
+    })
+end
+
+local function setStatus(text)
+    if statusLabel then
+        statusLabel:Set(text)
+    end
+end
+
+local function updateCounter()
+    if collectedLabel then
+        collectedLabel:Set("Items collected: " .. totalCollected)
+    end
+end
+
+local function getFolder()
+    return workspace:FindFirstChild(ITEM_FOLDER_NAME)
+end
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+-- Real world position of an item, whatever it is made of. Models use their
+-- parts (not their pivot, which can sit far away from the actual geometry).
+local function getItemPosition(item)
+    if item:IsA("BasePart") then
+        return item.Position
+    end
+    local handle = item:FindFirstChild("Handle", true)
+    if handle and handle:IsA("BasePart") then
+        return handle.Position
+    end
+    if item:IsA("Model") and item.PrimaryPart then
+        return item.PrimaryPart.Position
+    end
+    local low, high
+    for _, descendant in ipairs(item:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            local p = descendant.Position
+            low = low and low:Min(p) or p
+            high = high and high:Max(p) or p
+        end
+    end
+    if low and high then
+        return (low + high) / 2
+    end
+    return nil
+end
+
+local function isWaterAt(position)
+    local ok, result = pcall(function()
+        local region = Region3.new(position - Vector3.new(2, 2, 2), position + Vector3.new(2, 2, 2)):ExpandToGrid(4)
+        local materials = workspace.Terrain:ReadVoxels(region, 4)
+        for x = 1, #materials do
+            for y = 1, #materials[x] do
+                for z = 1, #materials[x][y] do
+                    if materials[x][y][z] == Enum.Material.Water then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end)
+    return ok and result == true
+end
+
+-- Safe Teleport: refuses spots that would drop the player into water or the void.
+local function checkLanding(position, item)
+    if position.X ~= position.X or position.Y ~= position.Y or position.Z ~= position.Z then
+        return false, "invalid position"
+    end
+    if position.Magnitude < 2 then
+        return false, "item is at the world origin"
+    end
+    if position.Y < -200 then
+        return false, "item is below the map"
+    end
+
+    local landing = position + Vector3.new(0, config.height, 0)
+    if isWaterAt(landing) or isWaterAt(position) then
+        return false, "location is in water"
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { item, LocalPlayer.Character }
+    local hit = workspace:Raycast(landing, Vector3.new(0, -150, 0), params)
+    if not hit then
+        return false, "nothing solid below the item"
+    end
+    if hit.Material == Enum.Material.Water or string.find(string.lower(hit.Instance.Name), "water", 1, true) then
+        return false, "item is over water"
+    end
+    return true
+end
+
+-- Moves the character above `position`, keeps its facing, clears fall speed.
+local function teleportToPosition(position, item)
+    local root = getRoot()
+    if not root then
+        return false, "no character"
+    end
+    if config.safe then
+        local ok, reason = checkLanding(position, item)
+        if not ok then
+            return false, reason
+        end
+    end
+
+    root.CFrame = CFrame.new(position + Vector3.new(0, config.height, 0)) * root.CFrame.Rotation
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    if lastTeleportLabel then
+        lastTeleportLabel:Set(string.format(
+            "Last teleport: %s  (%d, %d, %d)",
+            item.Name,
+            math.floor(position.X + 0.5),
+            math.floor(position.Y + 0.5),
+            math.floor(position.Z + 0.5)
+        ))
+    end
+    return true
+end
+
+-- Teleport only (used when "Collect On Select" is off).
+local function teleportOnly(label)
+    local item = itemMap[label]
+    if not (item and item.Parent) then
+        notify("Item unavailable", "That item no longer exists.", "Warning")
+        return
+    end
+    local position = getItemPosition(item)
+    if not position then
+        notify("Can't locate item", item.Name .. " has no physical part to teleport to.", "Warning")
+        return
+    end
+    local ok, reason = teleportToPosition(position, item)
+    if not ok then
+        notify("Teleport blocked", item.Name .. ": " .. reason .. ". Turn off Safe Teleport to force it.", "Warning")
+    end
+end
+
+-- Pickup prompts / click detectors (only fired when the executor supports it).
+local function getInteractables(item)
+    local list = {}
+    for _, descendant in ipairs(item:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") or descendant:IsA("ClickDetector") then
+            table.insert(list, descendant)
+        end
+    end
+    return list
+end
+
+local function fireInteractables(list)
+    for _, object in ipairs(list) do
+        if object:IsA("ProximityPrompt") then
+            if type(fireproximityprompt) == "function" then
+                pcall(fireproximityprompt, object)
+            end
+        elseif type(fireclickdetector) == "function" then
+            pcall(fireclickdetector, object)
+        end
+    end
+end
+
+-- Stays on one item until it has been picked up (it leaves the folder).
+-- Returns "picked", "timeout", "unsafe", "invalid", "interrupted" or "cancelled".
+local function collect(item, folder, token, isPriority)
+    local started = os.clock()
+    local interactables = getInteractables(item)
+    local lastScan, lastTeleport, lastInteract = os.clock(), 0, 0
+
+    while token == runToken do
+        if not item:IsDescendantOf(folder) then
+            return "picked"
+        end
+        if not isPriority and #priority > 0 then
+            return "interrupted" -- an item was picked in the dropdown
+        end
+
+        local now = os.clock()
+        local root = getRoot()
+        local position = getItemPosition(item)
+
+        if not root then
+            started = now -- waiting for a respawn does not count against the timeout
+        elseif now - started > config.timeout then
+            return "timeout"
+        elseif not position then
+            return "invalid"
+        else
+            if (root.Position - position).Magnitude > config.height + 4 and now - lastTeleport >= 0.25 then
+                lastTeleport = now
+                local ok, reason = teleportToPosition(position, item)
+                if not ok then
+                    failReason = reason
+                    setStatus("Skipped " .. item.Name .. ": " .. reason)
+                    return "unsafe"
+                end
+            end
+            if now - lastInteract >= 0.25 then
+                lastInteract = now
+                if #interactables == 0 and now - lastScan >= 1 then
+                    lastScan = now
+                    interactables = getInteractables(item)
+                end
+                fireInteractables(interactables)
+            end
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+    return "cancelled"
+end
+
+local function nextUnhandled(folder, handled)
+    local pick, queue = nil, 0
+    for _, item in ipairs(folder:GetChildren()) do
+        if not handled[item] then
+            queue += 1
+            if not pick then
+                pick = item
+            end
+        end
+    end
+    return pick, queue
+end
+
+local function stopRun()
+    runToken += 1
+    running = false
+    sweep = false
+    table.clear(priority)
+    setStatus("Status: Idle")
+end
+
+-- One worker handles everything: dropdown picks first, then (if enabled) every
+-- other item. It ends on its own when there is nothing left to do.
+local function startRun()
+    if running then
+        return
+    end
+    running = true
+    runToken += 1
+    local token = runToken
+
+    task.spawn(function()
+        local handled = setmetatable({}, { __mode = "k" })
+        local collected, skipped = 0, 0
+        local swept = false
+
+        while token == runToken do
+            local folder = getFolder()
+            local item, queue, fromPriority
+
+            if folder then
+                while #priority > 0 do
+                    local candidate = table.remove(priority, 1)
+                    if candidate.Parent and candidate:IsDescendantOf(folder) then
+                        item, fromPriority = candidate, true
+                        break
+                    end
+                end
+                if not item and (sweep or loopMode) then
+                    if sweep then
+                        swept = true
+                    end
+                    item, queue = nextUnhandled(folder, handled)
+                end
+            end
+
+            if item then
+                handled[item] = true
+                if fromPriority then
+                    setStatus("Collecting: " .. item.Name .. "  ·  selected")
+                else
+                    setStatus("Collecting: " .. item.Name .. "  ·  " .. queue .. " in queue")
+                end
+
+                local result = collect(item, folder, token, fromPriority)
+                if result == "picked" then
+                    collected += 1
+                    totalCollected += 1
+                    updateCounter()
+                    if fromPriority then
+                        notify("Collected", item.Name, "Success")
+                    end
+                elseif result == "interrupted" then
+                    handled[item] = nil -- come back to it after the selected item
+                elseif result ~= "cancelled" then
+                    skipped += 1
+                    if fromPriority then
+                        if result == "timeout" then
+                            notify("Not collected", item.Name .. " was not picked up within " .. config.timeout .. "s.", "Warning")
+                        elseif result == "unsafe" then
+                            notify("Teleport blocked", item.Name .. ": " .. failReason .. ". Turn off Safe Teleport to force it.", "Warning")
+                        else
+                            notify("Not collected", item.Name .. " has no physical part to teleport to.", "Warning")
+                        end
+                    end
+                end
+            elseif loopMode then
+                setStatus("Waiting for new items...")
+                task.wait(0.1)
+            else
+                break
+            end
+        end
+
+        if token == runToken then
+            running = false
+            setStatus("Status: Idle")
+            if swept and not loopMode then
+                notify("Collect finished", "Picked up " .. collected .. "  ·  Skipped " .. skipped, "Success")
+            end
+            sweep = false
+        end
+    end)
+end
+
+local function onSelect(label)
+    if not config.collectOnSelect then
+        teleportOnly(label)
+        return
+    end
+    local item = itemMap[label]
+    if not (item and item.Parent) then
+        notify("Item unavailable", "That item no longer exists.", "Warning")
+        return
+    end
+    table.insert(priority, 1, item)
+    if not running then
+        startRun()
+    end
+end
+
+local function onCollectButton()
+    if running and (sweep or loopMode) then
+        stopRun()
+        loopMode = false
+        if autoToggle then
+            autoToggle:Set(false, true)
+        end
+        notify("Collect stopped", "Stopped teleporting to items.", "Warning")
+        return
+    end
+
+    local folder = getFolder()
+    if not folder then
+        notify("Folder not found", "workspace." .. ITEM_FOLDER_NAME .. " does not exist.", "Error")
+        return
+    end
+    if #folder:GetChildren() == 0 then
+        notify("No items", "Nothing is spawned right now.", "Warning")
+        return
+    end
+
+    sweep = true
+    if not running then
+        startRun()
+    end
+end
+
+-- Farm: UI ----------------------------------------------------------------
+Farm:Section("Item")
+
+countLabel = Farm:Label({ Text = "Items spawned: 0" })
+
+itemDropdown = Farm:Dropdown({
+    Name = "Spawned items",
+    Desc = "Select an item to teleport to it and collect it",
+    Options = {},
+    Callback = function(value)
+        if value == nil then
+            -- Clicking the highlighted entry again: do it again, keep it selected.
+            if lastLabel and itemMap[lastLabel] then
+                itemDropdown:Set(lastLabel, true)
+                onSelect(lastLabel)
+            end
+            return
+        end
+        lastLabel = value
+        onSelect(value)
+    end,
+})
+
+Farm:Toggle({
+    Name = "Collect On Select",
+    Desc = "Picking an item also collects it, not just teleports",
+    Default = true,
+    Callback = function(value)
+        config.collectOnSelect = value
+    end,
+})
+
+lastTeleportLabel = Farm:Label({ Text = "Last teleport: none" })
+
+Farm:Section("Collect")
+
+Farm:Button({
+    Name = "Teleport To All Item",
+    Desc = "Visits every item one by one, moving on once it is picked up",
+    Icon = "map-pin",
+    Style = "Primary",
+    Callback = onCollectButton,
+})
+
+autoToggle = Farm:Toggle({
+    Name = "Auto Collect All Items",
+    Desc = "Teleports to every item and collects it, including new spawns",
+    Default = false,
+    Callback = function(value)
+        loopMode = value
+        if value then
+            if not running then
+                startRun()
+            end
+        elseif running and not sweep then
+            stopRun()
+            notify("Auto Collect off", "Stopped collecting items.", "Warning")
+        end
+    end,
+})
+
+statusLabel = Farm:Label({ Text = "Status: Idle" })
+collectedLabel = Farm:Label({ Text = "Items collected: 0" })
+
+Farm:Section("Settings")
+
+Farm:Toggle({
+    Name = "Safe Teleport",
+    Desc = "Skips items over water or void and clears fall speed",
+    Default = true,
+    Callback = function(value)
+        config.safe = value
+    end,
+})
+
+Farm:Slider({
+    Name = "Teleport height",
+    Min = 0,
+    Max = 10,
+    Step = 0.5,
+    Default = 3,
+    Suffix = " studs",
+    Callback = function(value)
+        config.height = value
+    end,
+})
+
+Farm:Slider({
+    Name = "Pickup timeout",
+    Min = 3,
+    Max = 30,
+    Step = 1,
+    Default = 10,
+    Suffix = "s",
+    Callback = function(value)
+        config.timeout = value
+    end,
+})
+
+-- Farm: live item list -----------------------------------------------------
+-- Rebuilds the dropdown from the folder. Duplicate names get " #2", " #3", ...
+local lastSignature = nil
+local function rebuild()
+    local folder = getFolder()
+    local entries = {}
+    if folder then
+        for index, item in ipairs(folder:GetChildren()) do
+            table.insert(entries, { item = item, name = item.Name, index = index })
+        end
+        table.sort(entries, function(a, b)
+            if a.name == b.name then
+                return a.index < b.index
+            end
+            return a.name < b.name
+        end)
+    end
+
+    local options, map = {}, {}
+    for _, entry in ipairs(entries) do
+        local label = entry.name
+        local n = 1
+        while map[label] do
+            n += 1
+            label = entry.name .. " #" .. n
+        end
+        map[label] = entry.item
+        table.insert(options, label)
+    end
+
+    itemMap = map
+    countLabel:Set("Items spawned: " .. #options)
+
+    local signature = table.concat(options, "\0")
+    if signature == lastSignature then
+        return
+    end
+    lastSignature = signature
+
+    if lastLabel and not map[lastLabel] then
+        lastLabel = nil
+        itemDropdown:Set(nil, true)
+    end
+    itemDropdown:Refresh(options, true)
+end
+
+-- Rebuilds right away when idle, otherwise at most once per REBUILD_INTERVAL.
+local lastBuild, rebuildQueued = 0, false
+local function queueRebuild()
+    if rebuildQueued then
+        return
+    end
+    rebuildQueued = true
+    task.delay(math.max(0, REBUILD_INTERVAL - (os.clock() - lastBuild)), function()
+        rebuildQueued = false
+        lastBuild = os.clock()
+        rebuild()
+    end)
+end
+
+local folderConnections = {}
+local function watchFolder(folder)
+    for _, connection in ipairs(folderConnections) do
+        connection:Disconnect()
+    end
+    folderConnections = {
+        folder.ChildAdded:Connect(queueRebuild),
+        folder.ChildRemoved:Connect(queueRebuild),
+    }
+    rebuild()
+end
+
+rebuild() -- shows the current items immediately
+do
+    local existing = getFolder()
+    if existing then
+        watchFolder(existing)
+    end
+    -- Also covers the folder appearing later or being replaced.
+    workspace.ChildAdded:Connect(function(child)
+        if child.Name == ITEM_FOLDER_NAME then
+            watchFolder(child)
+        end
+    end)
+end
+
+-- Tab 3: Additional Tool ---------------------------------------------------
+local Additional = Window:Tab({
+    Name = "Additional Tool",
+    Icon = "eye",
+})
+
+-- ESP: engine from item_esp.lua ---------------------------------------------
+-- Nothing runs (no connections, no render loop, no GUI) until an ESP option is
+-- switched on, and everything is torn down again when both are off.
+do
+    local Workspace = game:GetService("Workspace")
+    local Camera = Workspace.CurrentCamera
+
+    local Items = {
+        ["Arrow"]                = Color3.fromRGB(255, 214, 90),
+        ["Rokakaka Fruit"]       = Color3.fromRGB(255, 95, 110),
+        ["Frog"]                 = Color3.fromRGB(95, 255, 135),
+        ["Requiem Arrow"]        = Color3.fromRGB(255, 90, 255),
+        ["Banknote"]             = Color3.fromRGB(125, 255, 170),
+        ["True Requiem Arrow"]   = Color3.fromRGB(255, 50, 130),
+        ["Green Baby"]           = Color3.fromRGB(70, 255, 70),
+        ["Pot"]                  = Color3.fromRGB(215, 160, 105),
+        ["Vampire Mask"]         = Color3.fromRGB(215, 40, 50),
+        ["DIO's Diary"]          = Color3.fromRGB(255, 205, 50),
+        ["DIO's Bone"]           = Color3.fromRGB(245, 245, 225),
+        ["Electric Orb"]         = Color3.fromRGB(90, 205, 255),
+        ["Esper Energy"]         = Color3.fromRGB(165, 125, 255),
+        ["Saint's Left Arm"]     = Color3.fromRGB(255, 255, 255),
+        ["Saint's Left Eye"]     = Color3.fromRGB(255, 255, 255),
+        ["Ice Sword"]            = Color3.fromRGB(155, 235, 255),
+        ["Jotaro's Diary"]       = Color3.fromRGB(80, 135, 255),
+        ["Samurai Diary"]        = Color3.fromRGB(255, 135, 65),
+        ["Devil Diary"]          = Color3.fromRGB(200, 20, 20),
+        ["Sonic's Shoes"]        = Color3.fromRGB(0, 175, 255),
+        ["Road Roller"]          = Color3.fromRGB(255, 195, 0),
+        ["Time Leaper Clock"]    = Color3.fromRGB(255, 165, 255),
+        ["Glitched Bone"]        = Color3.fromRGB(255, 0, 255),
+        ["X Orb"]                = Color3.fromRGB(255, 55, 55),
+        ["Traveler Kit"]         = Color3.fromRGB(185, 225, 145),
+        ["Bible"]                = Color3.fromRGB(255, 245, 195),
+        ["Golden Spin Ball"]     = Color3.fromRGB(255, 215, 0),
+        ["Clock"]                = Color3.fromRGB(215, 215, 215),
+        ["Dio Soul"]             = Color3.fromRGB(255, 232, 65),
+        ["Eyes of Saint Corpse"] = Color3.fromRGB(255, 255, 255),
+    }
+
+    local Lookup = {}
+    local itemNames = {}
+    for name, color in pairs(Items) do
+        Lookup[name:lower()] = { name = name, color = color }
+        table.insert(itemNames, name)
+    end
+    table.sort(itemNames)
+
+    local Tracked = {}
+    local Connections = {}
+    local Folder = nil
+    local started = false
+    local scanToken = 0
+    local HasDrawing = pcall(function() return Drawing.new end) and Drawing ~= nil
+
+    -- What is currently allowed to be shown.
+    local allEnabled = false
+    local selected = {}
+
+    local function allowed(name)
+        return allEnabled or selected[name] == true
+    end
+
+    local function isActive()
+        return allEnabled or next(selected) ~= nil
+    end
+
+    local function getGuiParent()
+        local ok, ui = pcall(function() return gethui and gethui() end)
+        if ok and ui then return ui end
+        return game:GetService("CoreGui")
+    end
+
+    local function newDrawing(class, props)
+        local obj = Drawing.new(class)
+        for k, v in pairs(props) do obj[k] = v end
+        return obj
+    end
+
+    local function matchInstance(inst)
+        local info = Lookup[inst.Name:lower()]
+        if info then return info end
+        if inst:IsA("ProximityPrompt") then
+            return Lookup[(inst.ObjectText or ""):lower()] or Lookup[(inst.ActionText or ""):lower()]
+        end
+    end
+
+    local function resolveTarget(inst)
+        if inst:IsA("ProximityPrompt") then
+            local p = inst.Parent
+            if p and p:IsA("Attachment") then p = p.Parent end
+            if p and p:IsA("BasePart") then
+                return p:FindFirstAncestorOfClass("Model") or p
+            end
+            return p
+        end
+        if inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Tool") then
+            return inst
+        end
+    end
+
+    local function getPart(target)
+        if target:IsA("BasePart") then return target end
+        if target:IsA("Model") then
+            return target.PrimaryPart or target:FindFirstChildWhichIsA("BasePart", true)
+        end
+        return target:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local DRAWING_KEYS = { "tracerGlow", "tracer", "ring", "dot", "edgeArrow", "edgeArrowLine", "edgeText" }
+
+    local function createEntry(target, info)
+        if not started or Tracked[target] or not allowed(info.name) then return end
+
+        local part = getPart(target)
+        if not part then
+            task.delay(0.25, function()
+                if started and target.Parent and not Tracked[target] then createEntry(target, info) end
+            end)
+            return
+        end
+
+        local color = info.color
+        local entry = { target = target, part = part, name = info.name, phase = math.random() * 6 }
+
+        local hl = Instance.new("Highlight")
+        hl.Adornee = target
+        hl.FillColor = color
+        hl.OutlineColor = color
+        hl.FillTransparency = 0.55
+        hl.OutlineTransparency = 0
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.Parent = Folder
+        entry.highlight = hl
+
+        local bb = Instance.new("BillboardGui")
+        bb.Adornee = part
+        bb.AlwaysOnTop = true
+        bb.Size = UDim2.fromOffset(math.clamp(#info.name * 8, 40, 200) + 130, 56)
+        bb.StudsOffset = Vector3.new(0, 3.5, 0)
+        bb.LightInfluence = 0
+        bb.ResetOnSpawn = false
+        bb.Parent = Folder
+        entry.gui = bb
+
+        local pill = Instance.new("Frame")
+        pill.AnchorPoint = Vector2.new(0.5, 0)
+        pill.Position = UDim2.new(0.5, 0, 0, 0)
+        pill.Size = UDim2.fromOffset(0, 30)
+        pill.AutomaticSize = Enum.AutomaticSize.X
+        pill.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
+        pill.BackgroundTransparency = 0.12
+        pill.BorderSizePixel = 0
+        pill.Parent = bb
+        Instance.new("UICorner", pill).CornerRadius = UDim.new(0, 9)
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = color
+        stroke.Thickness = 1.6
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.Parent = pill
+        entry.stroke = stroke
+
+        local grad = Instance.new("UIGradient")
+        grad.Color = ColorSequence.new(Color3.fromRGB(38, 38, 52), Color3.fromRGB(12, 12, 18))
+        grad.Rotation = 90
+        grad.Parent = pill
+
+        local pad = Instance.new("UIPadding")
+        pad.PaddingLeft = UDim.new(0, 0)
+        pad.PaddingRight = UDim.new(0, 12)
+        pad.Parent = pill
+
+        local list = Instance.new("UIListLayout")
+        list.FillDirection = Enum.FillDirection.Horizontal
+        list.VerticalAlignment = Enum.VerticalAlignment.Center
+        list.Padding = UDim.new(0, 8)
+        list.SortOrder = Enum.SortOrder.LayoutOrder
+        list.Parent = pill
+
+        -- colored accent block on the left
+        local accent = Instance.new("Frame")
+        accent.LayoutOrder = 1
+        accent.Size = UDim2.fromOffset(26, 30)
+        accent.BackgroundColor3 = color
+        accent.BorderSizePixel = 0
+        accent.Parent = pill
+        Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 9)
+        local accentFix = Instance.new("Frame")
+        accentFix.AnchorPoint = Vector2.new(1, 0)
+        accentFix.Position = UDim2.fromScale(1, 0)
+        accentFix.Size = UDim2.new(0, 9, 1, 0)
+        accentFix.BackgroundColor3 = color
+        accentFix.BorderSizePixel = 0
+        accentFix.Parent = accent
+        local accentGrad = Instance.new("UIGradient")
+        accentGrad.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(170, 170, 170))
+        accentGrad.Rotation = 90
+        accentGrad.Parent = accent
+        local accentGrad2 = accentGrad:Clone()
+        accentGrad2.Parent = accentFix
+
+        local icon = Instance.new("TextLabel")
+        icon.Size = UDim2.fromScale(1, 1)
+        icon.BackgroundTransparency = 1
+        icon.Font = Enum.Font.GothamBold
+        icon.TextSize = 15
+        icon.TextColor3 = Color3.fromRGB(15, 15, 20)
+        icon.Text = "◆"
+        icon.ZIndex = 3
+        icon.Parent = accent
+        entry.icon = icon
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.LayoutOrder = 2
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.AutomaticSize = Enum.AutomaticSize.X
+        nameLabel.Size = UDim2.fromOffset(0, 30)
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 14
+        nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        nameLabel.TextStrokeTransparency = 0.7
+        nameLabel.Text = info.name
+        nameLabel.Parent = pill
+
+        local divider = Instance.new("Frame")
+        divider.LayoutOrder = 3
+        divider.Size = UDim2.fromOffset(1, 14)
+        divider.BackgroundColor3 = color
+        divider.BackgroundTransparency = 0.5
+        divider.BorderSizePixel = 0
+        divider.Parent = pill
+
+        local distLabel = Instance.new("TextLabel")
+        distLabel.LayoutOrder = 4
+        distLabel.BackgroundTransparency = 1
+        distLabel.AutomaticSize = Enum.AutomaticSize.X
+        distLabel.Size = UDim2.fromOffset(0, 30)
+        distLabel.Font = Enum.Font.GothamMedium
+        distLabel.TextSize = 12
+        distLabel.TextColor3 = color
+        distLabel.Text = "0m"
+        distLabel.Parent = pill
+        entry.distLabel = distLabel
+
+        local arrow = Instance.new("TextLabel")
+        arrow.AnchorPoint = Vector2.new(0.5, 0)
+        arrow.Position = UDim2.new(0.5, 0, 0, 28)
+        arrow.Size = UDim2.fromOffset(20, 16)
+        arrow.BackgroundTransparency = 1
+        arrow.Font = Enum.Font.GothamBold
+        arrow.TextSize = 16
+        arrow.TextColor3 = color
+        arrow.TextStrokeTransparency = 0.5
+        arrow.Text = "▼"
+        arrow.Parent = bb
+
+        if HasDrawing then
+            entry.tracerGlow = newDrawing("Line", { Thickness = 4, Color = color, Transparency = 0.25, Visible = false })
+            entry.tracer = newDrawing("Line", { Thickness = 1.5, Color = color, Transparency = 1, Visible = false })
+            entry.ring = newDrawing("Circle", { Radius = 7, Thickness = 1.5, Filled = false, NumSides = 24, Color = color, Transparency = 1, Visible = false })
+            entry.dot = newDrawing("Circle", { Radius = 3, Filled = true, NumSides = 20, Color = color, Transparency = 1, Visible = false })
+            entry.edgeArrow = newDrawing("Triangle", { Filled = true, Color = color, Transparency = 1, Visible = false })
+            entry.edgeArrowLine = newDrawing("Triangle", { Filled = false, Thickness = 1.5, Color = Color3.new(0, 0, 0), Transparency = 1, Visible = false })
+            entry.edgeText = newDrawing("Text", { Size = 13, Center = true, Outline = true, Color = color, Transparency = 1, Visible = false, Font = 2 })
+        end
+
+        entry.conn = target.AncestryChanged:Connect(function(_, parent)
+            if not parent then entry.dead = true end
+        end)
+
+        Tracked[target] = entry
+    end
+
+    local function removeEntry(target)
+        local e = Tracked[target]
+        if not e then return end
+        Tracked[target] = nil
+        if e.conn then e.conn:Disconnect() end
+        if e.highlight then e.highlight:Destroy() end
+        if e.gui then e.gui:Destroy() end
+        for _, key in ipairs(DRAWING_KEYS) do
+            if e[key] then pcall(function() e[key]:Remove() end) end
+        end
+    end
+
+    local function consider(inst)
+        local info = matchInstance(inst)
+        if not info or not allowed(info.name) then return end
+        local target = resolveTarget(inst)
+        if not target then return end
+        local model = target:FindFirstAncestorOfClass("Model")
+        if model and Players:GetPlayerFromCharacter(model) then return end
+        if Players:GetPlayerFromCharacter(target) then return end
+        createEntry(target, info)
+    end
+
+    local function renderStep()
+        Camera = Workspace.CurrentCamera
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local camCF = Camera.CFrame
+        local view = Camera.ViewportSize
+        local center = view / 2
+        local origin = Vector2.new(center.X, view.Y - 4)
+        local edgeRadius = math.min(view.X, view.Y) * 0.4
+        local t = os.clock()
+
+        for target, e in pairs(Tracked) do
+            if e.dead or not target.Parent or not e.part.Parent then
+                removeEntry(target)
+            else
+                local pos = e.part.Position
+                local dist = ((root and root.Position or camCF.Position) - pos).Magnitude
+                local pulse = (math.sin(t * 3 + e.phase) + 1) / 2
+
+                e.highlight.FillTransparency = 0.72 - pulse * 0.27
+                e.stroke.Transparency = 0.4 - pulse * 0.35
+                e.distLabel.Text = math.floor(dist) .. "m"
+
+                if e.tracer then
+                    local sp, onScreen = Camera:WorldToViewportPoint(pos)
+                    if onScreen and sp.Z > 0 then
+                        local to = Vector2.new(sp.X, sp.Y)
+                        e.edgeArrow.Visible = false
+                        e.edgeArrowLine.Visible = false
+                        e.edgeText.Visible = false
+
+                        e.tracerGlow.From = origin
+                        e.tracerGlow.To = to
+                        e.tracerGlow.Transparency = 0.12 + (1 - pulse) * 0.1
+                        e.tracerGlow.Visible = true
+                        e.tracer.From = origin
+                        e.tracer.To = to
+                        e.tracer.Visible = true
+
+                        e.ring.Position = to
+                        e.ring.Radius = 7 + pulse * 3
+                        e.ring.Visible = true
+                        e.dot.Position = to
+                        e.dot.Visible = true
+                    else
+                        e.tracerGlow.Visible = false
+                        e.tracer.Visible = false
+                        e.ring.Visible = false
+                        e.dot.Visible = false
+
+                        -- off-screen indicator pointing toward the item
+                        local rel = camCF:PointToObjectSpace(pos)
+                        local dir = Vector2.new(rel.X, -rel.Y)
+                        if dir.Magnitude < 0.001 then dir = Vector2.new(0, 1) end
+                        dir = dir.Unit
+                        local p = center + dir * edgeRadius
+                        local perp = Vector2.new(-dir.Y, dir.X)
+                        local tip = p + dir * 14
+                        local b1 = p - dir * 6 + perp * 10
+                        local b2 = p - dir * 6 - perp * 10
+
+                        e.edgeArrow.PointA = tip
+                        e.edgeArrow.PointB = b1
+                        e.edgeArrow.PointC = b2
+                        e.edgeArrow.Visible = true
+                        e.edgeArrowLine.PointA = tip
+                        e.edgeArrowLine.PointB = b1
+                        e.edgeArrowLine.PointC = b2
+                        e.edgeArrowLine.Visible = true
+
+                        e.edgeText.Text = e.name .. " · " .. math.floor(dist) .. "m"
+                        e.edgeText.Position = p - dir * 26 - Vector2.new(0, 7)
+                        e.edgeText.Visible = true
+                    end
+                end
+            end
+        end
+    end
+
+    local function start()
+        if started then return end
+        started = true
+        Folder = Instance.new("Folder")
+        Folder.Name = "ItemESP"
+        Folder.Parent = getGuiParent()
+
+        table.insert(Connections, Workspace.DescendantAdded:Connect(function(d)
+            consider(d)
+            if d:IsA("ProximityPrompt") then
+                task.defer(function() if started then consider(d) end end)
+                task.delay(0.3, function() if started then consider(d) end end)
+            end
+        end))
+        table.insert(Connections, RunService.RenderStepped:Connect(renderStep))
+    end
+
+    local function stop()
+        if not started then return end
+        started = false
+        scanToken += 1
+        for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
+        table.clear(Connections)
+        for target in pairs(Tracked) do
+            removeEntry(target)
+        end
+        if Folder then
+            Folder:Destroy()
+            Folder = nil
+        end
+    end
+
+    -- Applies the current selection: drops what is no longer wanted, then scans
+    -- the world for what newly is. The scan yields so it never causes a stutter.
+    local function sync()
+        if not isActive() then
+            stop()
+            return
+        end
+        start()
+
+        for target, e in pairs(Tracked) do
+            if not allowed(e.name) then
+                removeEntry(target)
+            end
+        end
+
+        scanToken += 1
+        local token = scanToken
+        task.spawn(function()
+            local count = 0
+            for _, d in ipairs(Workspace:GetDescendants()) do
+                if token ~= scanToken or not started then return end
+                consider(d)
+                count += 1
+                if count % 1500 == 0 then
+                    task.wait()
+                end
+            end
+        end)
+    end
+
+    if getgenv then
+        if getgenv().ItemESP_Unload then
+            pcall(getgenv().ItemESP_Unload)
+        end
+        getgenv().ItemESP_Unload = function()
+            allEnabled = false
+            table.clear(selected)
+            stop()
+        end
+    end
+
+    -- ESP: UI --------------------------------------------------------------
+    Additional:Section("ESP")
+
+    Additional:Toggle({
+        Name = "ESP All The Item",
+        Desc = "Shows every item from the list on the map",
+        Default = false,
+        Callback = function(value)
+            allEnabled = value
+            sync()
+        end,
+    })
+
+    Additional:Dropdown({
+        Name = "ESP selected items",
+        Desc = "Only the items you pick here get an ESP",
+        Options = itemNames,
+        Multi = true,
+        Default = {},
+        Callback = function(values)
+            table.clear(selected)
+            if type(values) == "table" then
+                for _, name in ipairs(values) do
+                    selected[name] = true
+                end
+            elseif type(values) == "string" then
+                selected[values] = true
+            end
+            sync()
+        end,
+    })
+end
+
+-- Sidebar divider (between Home and Farm) -------------------------------
+-- Airflow's Divider only works inside a page, so this adds a thin line to
+-- the sidebar tab list. Run it after all tabs have been created.
+local function addTabDivider(window, afterTab)
+    local list = window.TabList
+    if not list or not afterTab or not afterTab._button then
+        return
+    end
+
+    local slot = afterTab._button.LayoutOrder
+
+    -- Make room: push every later tab one slot down.
+    for _, tab in ipairs(window.Tabs) do
+        if tab._button.LayoutOrder > slot then
+            tab._button.LayoutOrder += 1
+        end
+    end
+
+    local divider = Instance.new("Frame")
+    divider.Name = "TabDivider"
+    divider.Size = UDim2.new(1, 0, 0, 9)
+    divider.BackgroundTransparency = 1
+    divider.LayoutOrder = slot + 1
+    divider.Parent = list
+
+    local line = Instance.new("Frame")
+    line.AnchorPoint = Vector2.new(0.5, 0.5)
+    line.Position = UDim2.new(0.5, 0, 0.5, 0)
+    line.Size = UDim2.new(1, -8, 0, 1)
+    line.BackgroundColor3 = Airflow.Theme.Stroke
+    line.BorderSizePixel = 0
+    line.Parent = divider
+end
+
+addTabDivider(Window, Home)
+
+-- Sidebar search --------------------------------------------------------
+-- Airflow has no built-in search box, so this is a small custom control.
+-- It sits above the tab list and filters the tab buttons by name.
+local function addSearchBar(window)
+    local list = window.TabList
+    local sidebar = list and list.Parent
+    if not sidebar then
+        return
+    end
+
+    local colors = Airflow.Theme
+
+    local holder = Instance.new("Frame")
+    holder.Name = "SearchBar"
+    holder.Position = UDim2.fromOffset(16, 80)
+    holder.Size = UDim2.new(1, -32, 0, 32)
+    holder.BackgroundColor3 = colors.Surface2
+    holder.BorderSizePixel = 0
+    holder.Parent = sidebar
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = holder
+
+    local outline = Instance.new("UIStroke")
+    outline.Color = colors.Stroke
+    outline.Thickness = 1
+    outline.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    outline.Parent = holder
+
+    local icon = Instance.new("ImageLabel")
+    icon.AnchorPoint = Vector2.new(0, 0.5)
+    icon.Position = UDim2.new(0, 10, 0.5, 0)
+    icon.Size = UDim2.fromOffset(14, 14)
+    icon.BackgroundTransparency = 1
+    icon.ImageColor3 = colors.Muted
+    icon.ScaleType = Enum.ScaleType.Fit
+    icon.Parent = holder
+
+    local box = Instance.new("TextBox")
+    box.Name = "Input"
+    box.Position = UDim2.fromOffset(32, 0)
+    box.Size = UDim2.new(1, -40, 1, 0)
+    box.BackgroundTransparency = 1
+    box.Text = ""
+    box.PlaceholderText = "Search..."
+    box.PlaceholderColor3 = colors.Muted
+    box.TextColor3 = colors.Text
+    box.TextSize = 13
+    box.FontFace = Airflow.Fonts.Regular
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.ClearTextOnFocus = false
+    box.ClipsDescendants = true
+    box.Parent = holder
+
+    local empty = Instance.new("TextLabel")
+    empty.Position = UDim2.fromOffset(16, 130)
+    empty.Size = UDim2.new(1, -32, 0, 18)
+    empty.BackgroundTransparency = 1
+    empty.Text = "No matching tabs"
+    empty.TextColor3 = colors.Muted
+    empty.TextSize = 12
+    empty.FontFace = Airflow.Fonts.Regular
+    empty.TextXAlignment = Enum.TextXAlignment.Left
+    empty.Visible = false
+    empty.Parent = sidebar
+
+    -- Push the tab list down to make room for the search bar.
+    list.Position = UDim2.fromOffset(0, 124)
+    list.Size = UDim2.new(1, 0, 1, -160)
+
+    box.Focused:Connect(function()
+        outline.Color = colors.StrokeHover
+    end)
+    box.FocusLost:Connect(function()
+        outline.Color = colors.Stroke
+    end)
+
+    box:GetPropertyChangedSignal("Text"):Connect(function()
+        local query = string.lower(box.Text)
+        local shown = 0
+        for _, tab in ipairs(window.Tabs) do
+            local match = query == "" or string.find(string.lower(tab.Name), query, 1, true) ~= nil
+            tab._button.Visible = match
+            if match then
+                shown += 1
+            end
+        end
+        empty.Visible = shown == 0
+
+        -- Hide the sidebar divider while a search is active.
+        local divider = list:FindFirstChild("TabDivider")
+        if divider then
+            divider.Visible = query == ""
+        end
+    end)
+
+    -- Search glyph: same lucide set Airflow already uses for its icons.
+    task.spawn(function()
+        local ok, set = pcall(function()
+            return loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/Icons/refs/heads/main/lucide/dist/Icons.lua"))()
+        end)
+        if not ok or type(set) ~= "table" then
+            return
+        end
+        local entry = (set.Icons and set.Icons["search"]) or set["search"]
+        if type(entry) == "table" then
+            local image = entry.Image
+            if type(image) == "number" then
+                image = "rbxassetid://" .. tostring(image)
+            end
+            icon.Image = (set.Spritesheets and set.Spritesheets[tostring(image)]) or image
+            icon.ImageRectOffset = entry.ImageRectPosition or Vector2.zero
+            icon.ImageRectSize = entry.ImageRectSize or Vector2.zero
+        elseif type(entry) == "string" then
+            icon.Image = entry
+        end
+    end)
+end
+
+addSearchBar(Window)
+
+-- Load notice (appears once the loading screen has finished) -------------
+task.delay(2.4, function()
+    Window:Notify({
+        Title = "LoxForgeUI loaded",
+        Content = "v1.0.0 Beta  ·  Press RightControl to hide or show.",
+        Type = "Success",
+        Icon = "check",
+        Duration = 4,
+    })
+end)
